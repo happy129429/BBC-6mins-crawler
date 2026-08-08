@@ -3,7 +3,7 @@ Languages: [English](README.md) / [简体中文](README-zh.md)
 
 A simple set of Python scripts for batch-crawling the audio and transcripts of BBC Learning English's 6 Minute English programs from the official BBC website.
 
-Specifically, it currently contains two relatively independent scripts: the JSON generator and the downloader. The JSON generator collects the metadata of all available programs at once and saves it in a JSON document. The downloader then reads the JSON data and downloads the transcript and audio file for each program, while adding some extra key-value pairs such as `media_download_url` to the JSON file.
+Specifically, it currently contains two relatively independent scripts: the JSON generator and the downloader. The JSON generator collects the metadata of all available programs at once and saves it in a JSON document. The downloader then reads the JSON data and downloads the transcript and audio file for each program sequentially, while adding key-value pairs such as `media_download_url` to the JSON file.
 
 The main part of the scripts in this simple crawler project was generated with the assistance of AI (DeepSeek LLM, specifically). The human author came up with the idea and is responsible for code review and debugging, with AI assistance.
 
