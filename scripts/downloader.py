@@ -10,7 +10,7 @@ from urllib.parse import urljoin
 from pathlib import Path
 
 # ==================== 配置区 ====================
-BASE_SAVE_DIR = r"D:\Archive\BBC6minutes"
+BASE_SAVE_DIR = r"D:\BBC6minute" # 请根据实际需要修改下载目录
 JSON_INPUT = "6minute_english_episodes.json"
 
 MAX_ITEMS = None              # 处理前 N 条（按日期升序，即最早的 N 条），None代表无限制
