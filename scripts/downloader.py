@@ -1,451 +1,400 @@
-import os
+"""逐期下载文字稿与媒体文件，并把进度回写 JSON。
+
+媒体获取策略（按顺序，命中即停）：
+1. 页面下载区/媒体标签中的直链（按真实扩展名保存，支持 mp3/wav/m4a/mp4 等）；
+2. 无直链时扫描页面中的 mpd 流媒体清单，交给 yt-dlp 下载，再用 ffmpeg 提取音频。
+
+完成判定以 JSON 中 local_media_path 的真实存在性为准（utils.has_local_media），
+配合每期处理后的即时 JSON 落盘，中断后重跑只会处理未完成的节目。
+"""
+
 import json
-import re
-import time
+import os
+import shutil
 import subprocess
-from datetime import datetime
-import requests
-from bs4 import BeautifulSoup
-from urllib.parse import urljoin
+import time
 from pathlib import Path
 
-# ==================== 配置区 ====================
-BASE_SAVE_DIR = r"D:\BBC6minute" # 请根据实际需要修改下载目录
-JSON_INPUT = "6minute_english_episodes.json"
-
-MAX_ITEMS = None              # 处理前 N 条（按日期升序，即最早的 N 条），None代表无限制
-EXTRACT_AUDIO_FROM_VIDEO = True
-KEEP_VIDEO_AFTER_EXTRACT = False
-
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-}
-REQUEST_TIMEOUT = 20
-DOWNLOAD_CHUNK_SIZE = 8192
-MARKER1 = "Latest 6 Minute English"
-MARKER2 = """Next
-Find an
-A-Z list of our programmes"""
-# ================================================
-
-def sanitize_filename(name):
-    # 移除开头和结尾的空白字符
-    name = name.strip()
-    # 替换非法字符
-    name = re.sub(r'[<>:"/\\|?*]', '_', name)
-    # 限制长度
-    if len(name) > 40:
-        name = name[:40]
-    # 再次去除首尾空格
-    return name.strip()
-
-def parse_date(date_str):
-    try:
-        return datetime.strptime(date_str, "%d %b %Y")
-    except (ValueError, TypeError):
-        return None
-
-def clean_transcript(text):
-    if not text:
-        return ""
-    if MARKER1 in text:
-        text = text.split(MARKER1, 1)[0].strip()
-    if MARKER2 in text:
-        text = text.split(MARKER2, 1)[0].strip()
-    text = re.sub(r'\n\s*\n', '\n\n', text)
-    text = re.sub(r'\n\s*$', '', text)
-    return text
-
 import requests
-import json
-from urllib.parse import urljoin
+from bs4 import BeautifulSoup
 
-def get_media_url(soup, page_url):
-    # 1. 优先从下载区域（widget-pagelink-download）查找音频/视频链接
+import config
+import utils
+from utils import (
+    clean_transcript,
+    extract_text_content,
+    is_transcript_cleaned,
+    msg,
+    parse_date,
+    sanitize_filename,
+)
+
+
+def get_media_url(soup, page_url=None):
+    """从节目页查找媒体直链，返回 (url, kind)；找不到返回 (None, None)。
+
+    查找顺序：下载区直链 → audio/video source 标签 → data-media 属性 →
+    页面任意已知扩展名链接。音频优先于视频。
+    （page_url 参数保留以兼容旧签名；原先基于它的 mediaselector API
+    兜底已移除——该接口不可用，mpd 页面改由 utils.find_mpd_url 处理。）
+    """
+    candidates = []
+
     download_area = soup.select_one('div.widget-pagelink-download')
     if download_area:
-        mp3_link = download_area.select_one('a.bbcle-download-extension-mp3, a[href*=".mp3"]')
-        if mp3_link:
-            return mp3_link['href'], 'audio'
-        mp4_link = download_area.select_one('a.bbcle-download-extension-mp4, a[href*=".mp4"]')
-        if mp4_link:
-            return mp4_link['href'], 'video'
+        for a in download_area.find_all("a", href=True):
+            kind, _ = utils.infer_media_kind_and_ext(a["href"])
+            if kind:
+                candidates.append((a["href"], kind))
+        result = _pick_preferred(candidates)
+        if result[0]:
+            return result
 
-    # 2. 原有用标签查找
-    audio_source = soup.select_one('audio source[src]')
+    for source in soup.select("audio source[src], video source[src]"):
+        kind, _ = utils.infer_media_kind_and_ext(source["src"])
+        if kind:
+            return source["src"], kind
+    # source 存在但扩展名无法识别：按标签类型兜底
+    audio_source = soup.select_one("audio source[src]")
     if audio_source:
-        return audio_source['src'], 'audio'
-    video_source = soup.select_one('video source[src]')
+        return audio_source["src"], "audio"
+    video_source = soup.select_one("video source[src]")
     if video_source:
-        return video_source['src'], 'video'
+        return video_source["src"], "video"
 
-    # 3. 查找 data-media 属性
-    media_tag = soup.select_one('[data-media]')
-    if media_tag and media_tag.get('data-media'):
-        url = media_tag['data-media']
-        return url, 'video' if '.mp4' in url.lower() else 'audio'
+    media_tag = soup.select_one("[data-media]")
+    if media_tag and media_tag.get("data-media"):
+        url = media_tag["data-media"]
+        kind, _ = utils.infer_media_kind_and_ext(url)
+        if kind:
+            return url, kind
+        return url, "video" if ".mp4" in url.lower() else "audio"
 
-    # 4. 直接找 .mp3/.mp4 链接
-    mp3_link = soup.select_one('a[href*=".mp3"]')
-    if mp3_link:
-        return mp3_link['href'], 'audio'
-    mp4_link = soup.select_one('a[href*=".mp4"]')
-    if mp4_link:
-        return mp4_link['href'], 'video'
+    for a in soup.select("a[href]"):
+        kind, _ = utils.infer_media_kind_and_ext(a["href"])
+        if kind:
+            candidates.append((a["href"], kind))
+    return _pick_preferred(candidates)
 
-    # 5. 通过 BBC 媒体 API 获取（尝试多个 mediaset）
-    video_div = soup.select_one('div.video[data-pid]')
-    if video_div:
-        pid = video_div['data-pid']
-        # 尝试不同的 mediaset 值
-        mediasets = ['pc', 'mobile', 'tablet', 'iptv']
-        api_urls = [
-            f"https://open.live.bbc.co.uk/mediaselector/5/select/version/2.0/mediaset/{ms}/vpid/{pid}/format/json"
-            for ms in mediasets
-        ] + [
-            f"https://www.bbc.co.uk/mediaselector/5/select/version/2.0/mediaset/{ms}/vpid/{pid}/format/json"
-            for ms in mediasets
-        ]
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Referer': page_url,
-            'Accept': 'application/json'
-        }
-        for url in api_urls:
-            try:
-                resp = requests.get(url, headers=headers, timeout=10)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    # 遍历 media 数组
-                    for media_item in data.get('media', []):
-                        for connection in media_item.get('connection', []):
-                            href = connection.get('href')
-                            if href:
-                                # 优先返回 MP3，否则 MP4
-                                if '.mp3' in href.lower():
-                                    return href, 'audio'
-                                elif '.mp4' in href.lower():
-                                    return href, 'video'
-                    # 如果没有明确的 MP3/MP4，尝试返回第一个 https 链接（可能是音频）
-                    for media_item in data.get('media', []):
-                        for connection in media_item.get('connection', []):
-                            href = connection.get('href')
-                            if href and href.startswith('http'):
-                                return href, 'audio'
-                else:
-                    # 非200状态码继续尝试下一个
-                    continue
-            except Exception as e:
-                continue  # 忽略单个端点的错误，继续尝试下一个
-        # 所有端点都失败
-        print(f"  ⚠️ 所有媒体 API 端点均无法获取媒体链接 (PID: {pid})")
 
+def _pick_preferred(candidates):
+    """从 (href, kind) 列表中选音频优先的第一条。"""
+    for href, kind in candidates:
+        if kind == "audio":
+            return href, kind
+    for href, kind in candidates:
+        if kind == "video":
+            return href, kind
     return None, None
 
-def extract_text_content(soup):
-    content_div = soup.select_one('div[role="article"]')
-    if not content_div:
-        content_div = soup.select_one('div.text')
-    if not content_div:
-        content_div = soup.select_one('#bbcle-content')
-    if not content_div:
-        return ""
-    for tag in content_div(["script", "style", "noscript"]):
-        tag.decompose()
-    raw_text = content_div.get_text(separator="\n", strip=True)
-    return clean_transcript(raw_text)
+
+def fetch_episode_page(link):
+    """拉取节目页并返回 BeautifulSoup；失败返回 None。"""
+    try:
+        resp = utils.fetch_with_retry(link)
+        if resp.status_code == 200:
+            resp.encoding = "utf-8"
+            return BeautifulSoup(resp.text, "html.parser")
+        print(msg("http_status_fallback", code=resp.status_code))
+    except (requests.RequestException, ConnectionError, TimeoutError) as error:
+        print(msg("request_error_fallback", error=error))
+    return None
+
 
 def download_file(url, dest_path):
+    """流式下载文件；失败时清理残留文件并返回 False。"""
     try:
-        if url.startswith('//'):
-            url = 'https:' + url
-        elif url.startswith('/'):
-            url = urljoin('https://www.bbc.co.uk', url)
-        with requests.get(url, headers=HEADERS, stream=True, timeout=REQUEST_TIMEOUT) as r:
+        url = utils.normalize_url(url)
+        with requests.get(url, headers=config.HEADERS, stream=True,
+                          timeout=config.REQUEST_TIMEOUT) as r:
             r.raise_for_status()
-            total_size = int(r.headers.get('content-length', 0))
+            total_size = int(r.headers.get("content-length", 0))
             downloaded = 0
-            with open(dest_path, 'wb') as f:
-                for chunk in r.iter_content(chunk_size=DOWNLOAD_CHUNK_SIZE):
+            with open(dest_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=config.DOWNLOAD_CHUNK_SIZE):
                     if chunk:
                         f.write(chunk)
                         downloaded += len(chunk)
                         if total_size > 0:
                             percent = (downloaded / total_size) * 100
-                            print(f"\r      下载进度: {percent:.1f}%", end="")
+                            print("\r      " + msg("download_progress", percent=percent),
+                                  end="")
             if total_size > 0:
                 print()
             return True
-    except Exception as e:
-        print(f"\n      下载失败: {e}")
+    except Exception as error:
+        print("\n      " + msg("download_failed", error=error))
         if os.path.exists(dest_path):
             os.remove(dest_path)
         return False
 
+
 def extract_audio_from_video(video_path, audio_path):
+    """用 ffmpeg 从视频提取 128k mp3 音频。"""
     try:
-        subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
+        subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True)
     except (subprocess.SubprocessError, FileNotFoundError):
-        print("      ⚠ 未找到 ffmpeg，请安装并添加到 PATH")
+        print(msg("ffmpeg_missing"))
         return False
-    print(f"\n      🎵 正在用 ffmpeg 提取音频...")
-    cmd = [
-        'ffmpeg', '-i', str(video_path),
-        '-vn', '-ab', '128k', '-y', str(audio_path)
-    ]
+    print(msg("ffmpeg_extracting"))
+    cmd = ["ffmpeg", "-i", str(video_path), "-vn", "-ab", "128k", "-y", str(audio_path)]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        result = subprocess.run(cmd, capture_output=True, text=True,
+                                timeout=config.FFMPEG_TIMEOUT)
         if result.returncode == 0 and os.path.exists(audio_path):
-            print(f"      ✅ 音频提取成功：{audio_path}")
+            print(msg("ffmpeg_success", path=audio_path))
             return True
-        else:
-            print(f"      ❌ ffmpeg 提取失败: {result.stderr[:200]}")
-            return False
+        print(msg("ffmpeg_failed", error=result.stderr[:200]))
+        return False
     except subprocess.TimeoutExpired:
-        print("      ❌ ffmpeg 超时")
+        print(msg("ffmpeg_timeout"))
         return False
 
-def process_episode(ep, idx, total):
-    title = ep.get('title', '未知标题')
-    ep_num = ep.get('episode_number', f'EP_{idx+1:06d}')
-    link = ep.get('link')
+
+def download_via_yt_dlp(mpd_url, save_folder):
+    """用 yt-dlp 下载 mpd 清单媒体，统一命名为 media.<ext>。
+
+    返回 (是否成功, 最终媒体文件路径)。
+    """
+    if shutil.which("yt-dlp") is None:
+        print(msg("ytdlp_missing"))
+        return False, None
+    print(msg("ytdlp_downloading"))
+    output_template = str(Path(save_folder) / "source.%(ext)s")
+    cmd = ["yt-dlp", "-o", output_template, "--no-playlist", mpd_url]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True,
+                                timeout=config.YTDLP_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        print(msg("ytdlp_timeout"))
+        return False, None
+    if result.returncode != 0:
+        print(msg("ytdlp_failed", error=(result.stderr or "")[:200]))
+        return False, None
+
+    candidates = sorted(Path(save_folder).glob("source.*"))
+    if not candidates:
+        print(msg("ytdlp_no_output"))
+        return False, None
+    source = candidates[0]
+    _, ext = utils.infer_media_kind_and_ext(source.name)
+    if ext is None:
+        ext = ".mp4"  # 兜底：yt-dlp 常见产出为 mp4/webm
+    final_path = Path(save_folder) / f"media{ext}"
+    if final_path.exists():
+        final_path.unlink()
+    source.replace(final_path)
+    print(msg("ytdlp_success", name=final_path.name))
+    return True, final_path
+
+
+def _find_existing_media(save_folder):
+    """在节目文件夹中查找已存在的媒体文件（media.* > downloaded.* > source.*）。"""
+    folder = Path(save_folder)
+    if not folder.is_dir():
+        return None
+    for pattern in ("media.*", "downloaded.*", "source.*"):
+        for candidate in sorted(folder.glob(pattern)):
+            if candidate.is_file():
+                return candidate
+    return None
+
+
+def _handle_transcript(soup, save_folder, logger):
+    """保存/清理文字稿：新文本优先，失败时回退旧文本。"""
+    text_path = Path(save_folder) / "transcript.txt"
+    if soup is not None:
+        content = extract_text_content(soup)
+        if content:
+            text_path.write_text(content, encoding="utf-8")
+            logger.info(msg("transcript_saved", n=len(content)))
+            return
+        logger.warning(msg("transcript_not_extracted"))
+    if text_path.exists():
+        old = text_path.read_text(encoding="utf-8")
+        text_path.write_text(clean_transcript(old), encoding="utf-8")
+        logger.info(msg("transcript_cleaned_old"))
+    else:
+        text_path.write_text(msg("transcript_placeholder"), encoding="utf-8")
+        logger.warning(msg("transcript_missing"))
+
+
+def _download_direct(media_url, kind, save_folder, logger):
+    """下载直链媒体并统一命名为 media.<真实扩展名>；返回最终路径或 None。"""
+    inferred_kind, ext = utils.infer_media_kind_and_ext(media_url)
+    if ext is None:
+        ext = ".mp3" if kind == "audio" else ".mp4"
+    kind = inferred_kind or kind
+
+    temp_path = Path(save_folder) / f"downloaded{ext}"
+    final_path = Path(save_folder) / f"media{ext}"
+    print(msg("media_downloading", url=media_url))
+    if not download_file(media_url, temp_path):
+        logger.warning(msg("media_download_failed", url=media_url))
+        return None
+
+    # 立即定名为 media.<ext>：即使后续转码失败，下次运行也能识别为已完成
+    if final_path.exists():
+        final_path.unlink()
+    temp_path.replace(final_path)
+
+    if kind == "video" and config.EXTRACT_AUDIO_FROM_VIDEO:
+        audio_path = final_path.with_suffix(".mp3")
+        if extract_audio_from_video(final_path, audio_path):
+            if not config.KEEP_VIDEO_AFTER_EXTRACT:
+                final_path.unlink()
+                print(msg("video_deleted"))
+            return audio_path
+    return final_path
+
+
+def _finalize_video(path, logger):
+    """若文件是视频且开启提取，转出 mp3 并按配置清理原视频；返回最终路径。"""
+    final_path = Path(path)
+    kind, _ = utils.infer_media_kind_and_ext(final_path.name)
+    if kind == "video" and config.EXTRACT_AUDIO_FROM_VIDEO:
+        audio_path = final_path.with_suffix(".mp3")
+        if extract_audio_from_video(final_path, audio_path):
+            if not config.KEEP_VIDEO_AFTER_EXTRACT:
+                final_path.unlink()
+                print(msg("video_deleted"))
+            return audio_path
+    return final_path
+
+
+def process_episode(ep, idx, total, logger):
+    """处理单期节目：文字稿 + 媒体，并把进度写回 ep（就地修改）。"""
+    title = ep.get("title", "")
+    ep_num = ep.get("episode_number") or f"EP_{idx + 1:06d}"
+    link = ep.get("link")
     if not link:
-        print(f"[{idx+1}/{total}] 跳过：{title} (无链接)")
+        logger.info(msg("skip_no_link", i=idx + 1, n=total, title=title))
         return False
 
     safe_title = sanitize_filename(title)
-    folder_name = f"{ep_num}_{safe_title}"
-    save_folder = Path(BASE_SAVE_DIR) / folder_name
-
-    folder_exists = save_folder.exists()
-    media_files = list(save_folder.glob("media.*")) if folder_exists else []
-    has_media = len(media_files) > 0
-
-    if has_media:
-        print(f"[{idx+1}/{total}] 📁 文件夹已存在，发现媒体文件：{media_files[0].name}")
-        if not ep.get('local_media_path'):
-            ep['local_media_path'] = str(media_files[0])
-    else:
-        print(f"[{idx+1}/{total}] 📄 处理：{title}")
-
-    # ---- 1. 尝试获取页面内容 ----
-    soup = None
+    save_folder = config.get_save_dir() / f"{ep_num}_{safe_title}"
     try:
-        resp = requests.get(link, headers=HEADERS, timeout=REQUEST_TIMEOUT)
-        resp.encoding = 'utf-8'
-        if resp.status_code == 200:
-            soup = BeautifulSoup(resp.text, 'html.parser')
-        else:
-            print(f"  请求返回状态码 {resp.status_code}，将使用旧文本（如果存在）")
-    except Exception as e:
-        print(f"  请求异常：{e}，将使用旧文本（如果存在）")
-
-    # ---- 2. 处理文本（无论请求是否成功） ----
-    save_folder.mkdir(parents=True, exist_ok=True)
-    if not save_folder.exists():
-        print(f"  ❌ 无法创建文件夹：{save_folder}")
+        save_folder.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        logger.error(msg("mkdir_failed", path=save_folder, error=error))
         return False
-    text_path = save_folder / "transcript.txt"
 
-    if soup is not None:
-        # 请求成功：提取新文本并清理
-        text_content = extract_text_content(soup)
-        if text_content:
-            with open(text_path, 'w', encoding='utf-8') as f:
-                f.write(text_content)
-            print(f"  ✅ 文本已保存 ({len(text_content)} 字符)")
-        else:
-            # 新页面没有提取到文本，尝试保留旧文本并清理
-            if text_path.exists():
-                old_text = text_path.read_text(encoding='utf-8')
-                cleaned = clean_transcript(old_text)
-                with open(text_path, 'w', encoding='utf-8') as f:
-                    f.write(cleaned)
-                print(f"  ⚠️ 新页面未提取到文本，已对旧文本执行清理")
-            else:
-                text_path.write_text("(内容提取失败)", encoding='utf-8')
-                print("  ⚠️ 未提取到文本，且无旧文本可保留")
-    else:
-        # 请求失败：尝试使用旧文本并清理
-        if text_path.exists():
-            old_text = text_path.read_text(encoding='utf-8')
-            cleaned = clean_transcript(old_text)
-            with open(text_path, 'w', encoding='utf-8') as f:
-                f.write(cleaned)
-            print(f"  ✅ 已对旧文本执行清理并保存")
-        else:
-            text_path.write_text("(页面请求失败，且无旧文本)", encoding='utf-8')
-            print("  ⚠️ 页面请求失败，且无旧文本可保留")
+    logger.info(msg("processing", i=idx + 1, n=total, title=title))
 
-    # ---- 3. 处理媒体（仅当请求成功且没有媒体文件时） ----
-    if soup is not None:
-        media_url, media_type = get_media_url(soup, link)
-    else:
-        media_url = None
+    # ---- 0. 恢复：JSON 缺路径但文件夹里已有媒体 ----
+    if not utils.has_local_media(ep):
+        existing = _find_existing_media(save_folder)
+        if existing is not None:
+            ep["local_media_path"] = str(existing)
+            logger.info(msg("media_restored", name=existing.name))
 
-    if not media_url:
-        # 如果没有找到链接，记录 None，但如果有旧链接且已有媒体，可能保留旧链接
-        print("  ⚠️ 未找到媒体链接（或请求失败）")
-        if not ep.get('media_download_url'):
-            ep['media_download_url'] = None
-        if not ep.get('local_media_path') and has_media:
-            ep['local_media_path'] = str(media_files[0])
-        # 如果请求失败但已有媒体，我们仍然可以返回 True
+    media_done = utils.has_local_media(ep)
+
+    # ---- 1. 拉取页面 ----
+    soup = fetch_episode_page(link)
+
+    # ---- 2. 文字稿 ----
+    _handle_transcript(soup, save_folder, logger)
+
+    # ---- 3. 媒体 ----
+    if media_done:
+        logger.info(msg("media_exists", path=ep.get("local_media_path")))
+        if not ep.get("media_download_url") and soup is not None:
+            media_url, _ = get_media_url(soup, link)
+            if not media_url:
+                media_url = utils.find_mpd_url(soup)
+            if media_url:
+                ep["media_download_url"] = utils.normalize_url(media_url)
         return True
 
-    # 补全 URL
-    if media_url.startswith('//'):
-        media_url = 'https:' + media_url
-    elif media_url.startswith('/'):
-        media_url = urljoin('https://www.bbc.co.uk', media_url)
+    media_url, kind = (None, None)
+    if soup is not None:
+        media_url, kind = get_media_url(soup, link)
+        if media_url:
+            media_url = utils.normalize_url(media_url)
 
-    # 只有没有媒体文件时才下载
-    if not has_media:
-        is_video = '.mp4' in media_url.lower()
-        ext = '.mp4' if is_video else '.mp3'
-        media_path = save_folder / f"downloaded{ext}"
-        print(f"  ↓ 下载媒体：{media_url}")
-        success = download_file(media_url, media_path)
+    if media_url:
+        final_path = _download_direct(media_url, kind, save_folder, logger)
+        ep["media_download_url"] = media_url
+        ep["local_media_path"] = str(final_path) if final_path else None
+        return True
 
-        if not success:
-            print("  ❌ 下载失败")
-            ep['media_download_url'] = media_url
-            ep['local_media_path'] = None
+    # 直链未命中 → 尝试 mpd 清单 + yt-dlp
+    if soup is not None:
+        mpd_url = utils.find_mpd_url(soup)
+        if mpd_url:
+            mpd_url = utils.normalize_url(mpd_url)
+            ok, path = download_via_yt_dlp(mpd_url, save_folder)
+            ep["media_download_url"] = mpd_url
+            ep["local_media_path"] = str(_finalize_video(path, logger)) if ok else None
             return True
 
-        # 处理视频转音频
-        final_media_path = media_path
-        if is_video and EXTRACT_AUDIO_FROM_VIDEO:
-            audio_path = save_folder / "media.mp3"
-            if extract_audio_from_video(media_path, audio_path):
-                final_media_path = audio_path
-                if not KEEP_VIDEO_AFTER_EXTRACT:
-                    os.remove(media_path)
-                    print(f"      🗑 已删除原视频文件")
-            else:
-                final_media_path = media_path
-        else:
-            if not is_video:
-                audio_path = save_folder / "media.mp3"
-                os.rename(media_path, audio_path)
-                final_media_path = audio_path
-            else:
-                video_path = save_folder / "media.mp4"
-                os.rename(media_path, video_path)
-                final_media_path = video_path
-
-        print(f"  ✅ 媒体最终保存为：{final_media_path}")
-        ep['media_download_url'] = media_url
-        ep['local_media_path'] = str(final_media_path)
-    else:
-        # 已有媒体，确保 JSON 中有路径
-        if not ep.get('local_media_path'):
-            ep['local_media_path'] = str(media_files[0])
-        if not ep.get('media_download_url'):
-            ep['media_download_url'] = media_url
-
+    logger.warning(msg("media_not_found"))
+    ep.setdefault("media_download_url", None)
     return True
 
-def is_transcript_cleaned(folder_path):
-    """检查 transcript.txt 是否已经清理完毕（不包含需要截断的标记）"""
-    text_path = Path(folder_path) / "transcript.txt"
-    if not text_path.exists():
-        return False
-    try:
-        content = text_path.read_text(encoding='utf-8')
-        # 如果包含任一标记，说明未清理
-        if MARKER1 in content or MARKER2 in content:
-            return False
+
+def _save_json(episodes):
+    with open(config.JSON_FILE, "w", encoding="utf-8") as f:
+        json.dump(episodes, f, ensure_ascii=False, indent=2)
+
+
+def _needs_processing(ep):
+    """待处理判定：媒体缺失，或文字稿尚未清理。"""
+    if not utils.has_local_media(ep):
         return True
-    except:
-        return False
+    folder = Path(ep["local_media_path"]).parent
+    return not is_transcript_cleaned(folder)
+
 
 def main():
-    Path(BASE_SAVE_DIR).mkdir(parents=True, exist_ok=True)
+    logger = utils.setup_logging(config.DOWNLOADER_LOG)
+    config.get_save_dir().mkdir(parents=True, exist_ok=True)
 
-    if not os.path.exists(JSON_INPUT):
-        print(f"错误：找不到 {JSON_INPUT}")
-        return
+    if not os.path.exists(config.JSON_FILE):
+        logger.error(msg("json_missing", file=config.JSON_FILE))
+        return 1
 
-    with open(JSON_INPUT, 'r', encoding='utf-8') as f:
+    with open(config.JSON_FILE, "r", encoding="utf-8") as f:
         all_episodes = json.load(f)
+    logger.info(msg("json_loaded", n=len(all_episodes)))
 
-    print(f"JSON 中共有 {len(all_episodes)} 条记录")
-
-    # ---- 解析日期，排序 ----
-    episodes_with_date = []
+    dated = []
     for ep in all_episodes:
-        dt = parse_date(ep.get('date', ''))
-        if dt is None:
-            continue
-        ep['_datetime'] = dt
-        episodes_with_date.append(ep)
+        dt = parse_date(ep.get("date", ""))
+        if dt is not None:
+            dated.append((dt, ep))
+    if not dated:
+        logger.error(msg("no_dated_records"))
+        return 1
+    dated.sort(key=lambda pair: pair[0])
+    episodes = [ep for _, ep in dated]
 
-    if not episodes_with_date:
-        print("没有可解析日期的记录")
-        return
+    pending = [ep for ep in episodes if _needs_processing(ep)]
+    logger.info(msg("pending_summary", total=len(episodes), pending=len(pending)))
 
-    episodes_with_date.sort(key=lambda x: x['_datetime'])
+    if config.MAX_ITEMS is not None:
+        pending = pending[:config.MAX_ITEMS]
+    if not pending:
+        logger.info(msg("nothing_pending"))
+        return 0
 
-    # ---- 清除临时 _datetime 字段，避免 JSON 序列化错误 ----
-    for ep in episodes_with_date:
-        ep.pop('_datetime', None)
+    logger.info(msg("batch_size", n=len(pending)))
 
-    # ---- 过滤出需要处理的记录：媒体缺失 或 文本未清理 ----
-    pending_episodes = []
-    for ep in episodes_with_date:
-        local_path = ep.get('local_media_path')
-        # 判断媒体是否存在
-        media_exists = local_path and os.path.exists(local_path)
-        if media_exists:
-            folder = Path(local_path).parent
-            # 如果媒体存在但文本未清理，仍然需要处理
-            if not is_transcript_cleaned(folder):
-                pending_episodes.append(ep)
-                continue
-            # 否则（媒体存在且文本已清理）跳过
+    updated = 0
+    for idx, ep in enumerate(pending):
+        if process_episode(ep, idx, len(pending), logger):
+            updated += 1
+            _save_json(all_episodes)  # 每期即时落盘，断点可续
+            logger.info(msg("json_saved", i=idx + 1, n=len(pending)))
         else:
-            # 媒体缺失，需要处理
-            pending_episodes.append(ep)
+            logger.warning(msg("episode_failed", i=idx + 1))
+        time.sleep(config.REQUEST_INTERVAL)
 
-    total_pending = len(pending_episodes)
-    print(f"总可解析记录 {len(episodes_with_date)} 条，待处理 {total_pending} 条")
+    _save_json(all_episodes)
+    logger.info(msg("done_summary", total=len(pending), updated=updated))
+    return 0
 
-    # ---- 取前 N 条待处理记录 ----
-    if MAX_ITEMS is not None:
-        episodes = pending_episodes[:MAX_ITEMS]
-    else:
-        episodes = pending_episodes
-
-    if not episodes:
-        print("没有待处理的记录")
-        return
-
-    print(f"本次处理前 {len(episodes)} 条（按日期升序）\n")
-
-    updated_count = 0
-    for idx, ep in enumerate(episodes):
-        ep.pop('_datetime', None)
-        success = process_episode(ep, idx, len(episodes))
-        if success:
-            updated_count += 1
-            # 立即保存 JSON
-            with open(JSON_INPUT, 'w', encoding='utf-8') as f:
-                json.dump(all_episodes, f, ensure_ascii=False, indent=2)
-            print(f"  💾 JSON 已更新（进度：{idx+1}/{len(episodes)}）")
-        else:
-            print(f"  ⚠️ 第 {idx+1} 条处理失败，未保存 JSON")
-
-        time.sleep(1.5)
-
-    # 最终保存
-    with open(JSON_INPUT, 'w', encoding='utf-8') as f:
-        json.dump(all_episodes, f, ensure_ascii=False, indent=2)
-
-    print(f"\n===== 处理完成 =====")
-    print(f"本次处理：{len(episodes)} 条")
-    print(f"成功更新：{updated_count} 条")
-    print(f"JSON 已更新：{JSON_INPUT}")
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
