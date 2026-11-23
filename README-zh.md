@@ -141,6 +141,8 @@ python3 -m pytest
 
 本项目源代码在 GNU通用公共许可证3.0版本（the GNU General Public License v3.0）下开源。BBC内容，包括音频和文字稿，不是本项目的一部分，因此不适用该许可证。
 
+本项目依赖的第三方组件（requests、beautifulsoup4、pytest 等）的许可证与版权声明，见 [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md)。
+
 ## 版权声明
 
 本项目不隶属于英国广播公司（BBC），也不由其背书。所有BBC内容均归其各自的权利持有人所有。如果您是权利持有人，并对本项目或其内容分发有任何顾虑，请联系我，我将及时删除或修改相关材料。

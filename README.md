@@ -142,6 +142,8 @@ The bulk of this project's code was generated with AI assistance (initial versio
 
 The source code of this project is licensed under the GNU General Public License v3.0. BBC content, including audio and transcripts, is not part of this project and thus not covered by this license.
 
+Licenses and copyright notices of the third-party components this project depends on (requests, beautifulsoup4, pytest, etc.) are listed in [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).
+
 ## Copyright
 
 This project is not affiliated with or endorsed by the BBC. All BBC content remains the property of its respective rights holders. If you are a rights holder and have concerns about this project or its distribution of content, please contact me and I will promptly remove or modify the relevant material.
